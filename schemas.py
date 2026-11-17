@@ -69,11 +69,11 @@ class LineItem(BaseModel):
 class InvoiceRecord(BaseModel):
     model_config = ConfigDict(frozen=True, str_strip_whitespace=True)
 
-    invoice_id: str = Field(min_length=3, pattern=r"^[A-Z0-9][A-Z0-9\-/]+$")
+    invoice_id: str = Field(min_length=3, pattern=r"^[A-Z0-9][A-Z0-9\-/_.]+$")
     vendor_name: str = Field(min_length=2)
     invoice_date: date
     due_date: date | None = None
-    currency: Literal["USD"] = "USD"
+    currency: str = Field(default="USD", pattern=r"^[A-Z]{3}$")
     line_items: list[LineItem] = Field(min_length=1)
     subtotal: Money = Field(ge=0)
     tax: Money = Field(ge=0)

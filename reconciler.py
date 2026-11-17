@@ -116,27 +116,138 @@ class LedgerLoad:
     errors: list[str] = field(default_factory=list)
 
 
-def load_ledger(path: Path) -> LedgerLoad:
+COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "txn_id": ("txn_id", "transaction id", "transaction_id", "txn id", "reference", "ref", "reference number",
+               "ref no", "id", "fitid"),
+    "posted_date": ("posted_date", "posting date", "posted date", "date", "transaction date", "trans date",
+                    "value date", "booking date"),
+    "description": ("description", "payee", "narration", "narrative", "memo", "details", "name",
+                    "transaction details", "remarks"),
+    "amount": ("amount", "debit", "debit amount", "withdrawal", "withdrawals", "money out", "paid out"),
+}
+CREDIT_ALIASES = ("credit", "credit amount", "deposit", "deposits", "money in", "paid in")
+LEDGER_DATE_FORMATS = {
+    "iso": ("%Y-%m-%d", "%Y/%m/%d"),
+    "day-first": ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%b-%Y", "%d %b %Y", "%d-%b-%y"),
+    "month-first": ("%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y", "%b %d, %Y", "%b %d %Y"),
+}
+
+
+def _canon(header: str) -> str:
+    return re.sub(r"[\s_]+", " ", header.strip().lower())
+
+
+def _map_columns(fieldnames: list[str]) -> tuple[dict[str, str], str | None]:
+    by_canon = {_canon(f): f for f in fieldnames}
+    mapping = {}
+    for key, aliases in COLUMN_ALIASES.items():
+        for alias in aliases:
+            if _canon(alias) in by_canon:
+                mapping[key] = by_canon[_canon(alias)]
+                break
+    credit = next((by_canon[_canon(a)] for a in CREDIT_ALIASES if _canon(a) in by_canon), None)
+    missing = {"posted_date", "description", "amount"} - mapping.keys()
+    if missing:
+        raise ValueError(
+            f"Ledger is missing column(s) {sorted(missing)}. Found columns: {fieldnames}. "
+            f"Accepted names: { {k: COLUMN_ALIASES[k] for k in sorted(missing)} }"
+        )
+    return mapping, credit
+
+
+def _pick_date_parser(values: list[str], date_order: str) -> tuple[str, ...]:
+    """Choose one consistent format family for the whole column so that
+    03/04/2026 is never read as March in one row and April in another."""
+    if date_order != "auto":
+        return LEDGER_DATE_FORMATS["iso"] + LEDGER_DATE_FORMATS[date_order]
+
+    def parses_all(fmts: tuple[str, ...]) -> bool:
+        return all(_parse_with(v, fmts) is not None for v in values if v.strip())
+
+    for family in ("iso", "day-first", "month-first"):
+        fmts = LEDGER_DATE_FORMATS["iso"] + LEDGER_DATE_FORMATS[family]
+        if parses_all(fmts):
+            return fmts
+    return LEDGER_DATE_FORMATS["iso"] + LEDGER_DATE_FORMATS["day-first"]
+
+
+def _parse_with(value: str, fmts: tuple[str, ...]):
+    value = value.strip()
+    for fmt in fmts:
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_amount(raw: str | None) -> Decimal | None:
+    if raw is None or not raw.strip():
+        return None
+    text = raw.strip()
+    negative = text.startswith("(") and text.endswith(")")
+    cleaned = re.sub(r"[^\d.\-]", "", text)
+    if cleaned in ("", "-", "."):
+        raise InvalidOperation(raw)
+    value = Decimal(cleaned)
+    return -value if negative else value
+
+
+@dataclass
+class LedgerLoad:
+    entries: list[LedgerEntry] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    skipped_credits: int = 0
+
+
+def load_ledger(path: Path, date_order: str = "auto") -> LedgerLoad:
+    """Load a bank export. Column names are matched against common aliases;
+    rows that are deposits (credit column only) are skipped; outgoing
+    payments are stored as positive amounts."""
+    if date_order not in ("auto", "day-first", "month-first"):
+        raise ValueError("date_order must be auto, day-first or month-first")
     out = LedgerLoad()
     with Path(path).open(newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        required = {"txn_id", "posted_date", "description", "amount"}
-        missing = required - set(reader.fieldnames or [])
-        if missing:
-            raise ValueError(f"Ledger is missing columns: {sorted(missing)}")
-        seen: set[str] = set()
-        for lineno, row in enumerate(reader, start=2):
-            try:
-                amount = abs(Decimal(row["amount"].replace("$", "").replace(",", "").strip()))
-                entry = LedgerEntry.model_validate({**row, "amount": amount})
-            except (InvalidOperation, ValidationError, AttributeError) as exc:
-                out.errors.append(f"line {lineno}: {exc}")
-                continue
-            if entry.txn_id in seen:
-                out.errors.append(f"line {lineno}: duplicate txn_id {entry.txn_id} skipped")
-                continue
-            seen.add(entry.txn_id)
-            out.entries.append(entry)
+        sample = fh.read(4096)
+        fh.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        rows = list(csv.DictReader(fh, dialect=dialect))
+        fieldnames = list(rows[0].keys()) if rows else []
+    if not rows:
+        raise ValueError(f"Ledger {path} has no data rows")
+    cols, credit_col = _map_columns(fieldnames)
+    date_fmts = _pick_date_parser([r.get(cols["posted_date"]) or "" for r in rows], date_order)
+
+    seen: set[str] = set()
+    for lineno, row in enumerate(rows, start=2):
+        try:
+            amount = _parse_amount(row.get(cols["amount"]))
+            if amount is None:
+                if credit_col and _parse_amount(row.get(credit_col)) is not None:
+                    out.skipped_credits += 1
+                    continue
+                raise InvalidOperation("empty amount")
+            posted = _parse_with(row.get(cols["posted_date"]) or "", date_fmts)
+            if posted is None:
+                raise ValueError(f"unrecognised date {row.get(cols['posted_date'])!r}")
+            txn_id = (row.get(cols["txn_id"]) or "").strip() if "txn_id" in cols else ""
+            entry = LedgerEntry(
+                txn_id=txn_id or f"ROW-{lineno}",
+                posted_date=posted,
+                description=row.get(cols["description"]) or "",
+                amount=abs(amount),
+            )
+        except (InvalidOperation, ValidationError, ValueError, AttributeError) as exc:
+            out.errors.append(f"line {lineno}: {exc}".splitlines()[0])
+            continue
+        if entry.txn_id in seen:
+            out.errors.append(f"line {lineno}: duplicate txn_id {entry.txn_id} skipped")
+            continue
+        seen.add(entry.txn_id)
+        out.entries.append(entry)
     for err in out.errors:
         log.warning("ledger %s", err)
     return out
@@ -412,26 +523,98 @@ def write_outputs(report: ReconciliationReport, out_dir: Path) -> dict[str, Path
     return paths
 
 
-def run_pipeline(invoice_dir: Path, ledger_path: Path, out_dir: Path | None = None) -> ReconciliationReport:
+def _md_money(v: Decimal | None) -> str:
+    return f"{v:,.2f}" if v is not None else ""
+
+
+def _md_cell(text: object) -> str:
+    return str(text if text is not None else "").replace("|", "\\|").replace("\n", " ")
+
+
+def write_markdown_summary(report: ReconciliationReport, path: Path) -> None:
+    """A readable summary for GitHub's job-summary page (or any Markdown viewer)."""
+    lines = [
+        "## Reconciliation results",
+        "",
+        f"**{len(report.approved)}** auto-approved ({_md_money(_total(report.approved))}) · "
+        f"**{len(report.review)}** need review ({_md_money(_total(report.review))}) · "
+        f"**{len(report.unmatched_ledger)}** ledger payments with no invoice",
+        "",
+    ]
+    if report.ledger_errors:
+        lines += [f"> ⚠️ {len(report.ledger_errors)} ledger row(s) could not be read: "
+                  + "; ".join(report.ledger_errors[:5]) + ("…" if len(report.ledger_errors) > 5 else ""), ""]
+    if report.review:
+        lines += ["### Needs review", "", "| Invoice | Vendor | Total | Confidence | Why | Detail |",
+                  "|---|---|--:|--:|---|---|"]
+        for r in report.review:
+            lines.append("| " + " | ".join(_md_cell(x) for x in (
+                r.invoice_id or r.source_file, r.vendor_name, _md_money(r.invoice_total), f"{r.confidence:.0f}",
+                ", ".join(x.value for x in r.reasons), r.detail)) + " |")
+        lines.append("")
+    if report.approved:
+        lines += ["### Approved", "", "| Invoice | Vendor | Total | Ledger txn | Posted | Confidence |",
+                  "|---|---|--:|---|---|--:|"]
+        for r in report.approved:
+            lines.append("| " + " | ".join(_md_cell(x) for x in (
+                r.invoice_id, r.vendor_name, _md_money(r.invoice_total), r.ledger_txn_id, r.ledger_date,
+                f"{r.confidence:.0f}")) + " |")
+        lines.append("")
+    if report.unmatched_ledger:
+        lines += ["### Ledger payments with no matching invoice", "", "| Txn | Posted | Description | Amount |",
+                  "|---|---|---|--:|"]
+        for e in report.unmatched_ledger:
+            lines.append(f"| {_md_cell(e.txn_id)} | {e.posted_date} | {_md_cell(e.description)} | {_md_money(e.amount)} |")
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+class PipelineInputError(Exception):
+    """Bad input paths or files; reported to the user without a traceback."""
+
+
+def run_pipeline(
+    invoice_dir: Path,
+    ledger_path: Path,
+    out_dir: Path | None = None,
+    date_order: str = "auto",
+) -> ReconciliationReport:
+    invoice_dir, ledger_path = Path(invoice_dir), Path(ledger_path)
+    if not invoice_dir.is_dir():
+        raise PipelineInputError(f"Invoice folder not found: {invoice_dir}")
+    if not any(invoice_dir.glob("*.pdf")) and not any(invoice_dir.glob("*.PDF")):
+        raise PipelineInputError(f"No PDF files in {invoice_dir}")
+    if not ledger_path.is_file():
+        raise PipelineInputError(f"Ledger CSV not found: {ledger_path}")
     batch = extract_directory(invoice_dir)
-    ledger = load_ledger(ledger_path)
+    try:
+        ledger = load_ledger(ledger_path, date_order=date_order)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise PipelineInputError(f"Could not read ledger {ledger_path}: {exc}") from exc
     report = reconcile(batch.records, ledger.entries, batch.failures)
     report.ledger_errors = ledger.errors
     if out_dir is not None:
-        write_outputs(report, out_dir)
+        write_outputs(report, Path(out_dir))
+        write_markdown_summary(report, Path(out_dir) / "summary.md")
     return report
 
 
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--invoices", type=Path, default=Path("sample_invoices"))
-    ap.add_argument("--ledger", type=Path, default=Path("bank_ledger.csv"))
+    ap.add_argument("--invoices", type=Path, default=Path("sample_invoices"), help="folder of PDF invoices")
+    ap.add_argument("--ledger", type=Path, default=Path("bank_ledger.csv"), help="bank export CSV")
     ap.add_argument("--out", type=Path, default=Path("output"))
+    ap.add_argument("--date-order", choices=["auto", "day-first", "month-first"], default="auto",
+                    help="how to read ambiguous ledger dates like 03/04/2026 (auto prefers day-first)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s %(message)s")
 
-    report = run_pipeline(args.invoices, args.ledger, args.out)
+    try:
+        report = run_pipeline(args.invoices, args.ledger, args.out, args.date_order)
+    except PipelineInputError as exc:
+        print(f"ERROR: {exc}")
+        return 2
     print(f"Approved: {len(report.approved)}  Needs review: {len(report.review)}  "
           f"Unmatched ledger: {len(report.unmatched_ledger)}")
     for r in report.approved:
@@ -439,7 +622,8 @@ def main() -> None:
     for r in report.review:
         print(f"  REVIEW   {r.invoice_id or '-':<14} {r.confidence:5.1f}  {','.join(x.value for x in r.reasons)}")
     print(f"Outputs written to {args.out}/")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -26,20 +26,34 @@ from schemas import ExtractionFailure, InvoiceRecord, ReasonCode
 log = logging.getLogger(__name__)
 
 MATH_ERROR_TYPES = {"invoice_math"}
-DATE_FORMATS = ("%Y-%m-%d", "%b %d, %Y", "%B %d, %Y", "%m/%d/%Y", "%d %b %Y", "%d %B %Y")
-MONEY_RE = r"\$?\s*(-?[\d,]+\.\d{2})"
+DEFAULT_CURRENCY = "USD"
+DATE_FORMATS = (
+    "%Y-%m-%d", "%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d/%m/%Y", "%m/%d/%Y",
+)
+CURRENCY_SYMBOLS = {"$": "USD", "₦": "NGN", "£": "GBP", "€": "EUR", "₹": "INR", "¥": "JPY"}
+MONEY_RE = r"(?:[A-Z]{3}\s*)?[$₦£€₹¥]?\s*(-?[\d,]+(?:\.\d{1,2})?)"
 
 FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
-    "invoice_id": re.compile(r"Invoice\s*(?:Number|No\.?|#)\s*:?\s*([A-Za-z0-9][A-Za-z0-9\-/]+)", re.I),
-    "invoice_date": re.compile(r"Invoice\s*Date\s*:?\s*(.+)", re.I),
-    "due_date": re.compile(r"Due\s*Date\s*:?\s*(.+)", re.I),
-    "currency": re.compile(r"Currency\s*:?\s*([A-Z]{3})", re.I),
+    "invoice_id": re.compile(
+        r"Invoice\s*(?:Number|No\.?|#|ID)\s*:?\s*#?\s*([A-Za-z0-9][A-Za-z0-9\-/_.]*[A-Za-z0-9])", re.I),
+    "invoice_date": re.compile(r"(?:Invoice|Issue|Issued)\s*Date\s*:?\s*(.+)", re.I),
+    "due_date": re.compile(r"(?:Due|Payment\s+Due)\s*Date\s*:?\s*(.+)", re.I),
+    "currency": re.compile(r"Currency\s*:?\s*([A-Z]{3})\b", re.I),
     "subtotal": re.compile(r"^\s*Sub[\s-]?total\s*:?\s*" + MONEY_RE, re.I | re.M),
-    "tax": re.compile(r"^\s*(?:Sales\s+)?Tax\b[^:\n]*:?\s*" + MONEY_RE, re.I | re.M),
-    "total": re.compile(r"^\s*(?:Total\s*Due|Amount\s*Due|Total)\s*:?\s*" + MONEY_RE, re.I | re.M),
+    "tax": re.compile(r"^\s*(?:Sales\s+)?(?:Tax|VAT|GST|HST)\b[^:\n]*:?\s*" + MONEY_RE, re.I | re.M),
+    "total": re.compile(
+        r"^\s*(?:Total\s*Due|Amount\s*Due|Balance\s*Due|Grand\s*Total|Total\s*Amount|Invoice\s*Total|Total)"
+        r"\s*(?:\([A-Z]{3}\))?\s*:?\s*" + MONEY_RE, re.I | re.M),
 }
+VENDOR_LABEL_RE = re.compile(r"^\s*(?:From|Vendor|Supplier|Seller|Bill\s*From|Remit\s*To)\s*:\s*(.+?)\s*$", re.I | re.M)
+
 # Fallback for line items when no ruled table is detected.
-LINE_ITEM_RE = re.compile(r"^(?P<desc>.+?)\s+(?P<qty>\d+(?:\.\d+)?)\s+\$?(?P<price>[\d,]+\.\d{2})\s+\$?(?P<amount>[\d,]+\.\d{2})\s*$")
+_SYM = r"(?:[A-Z]{3}\s*)?[$₦£€₹¥]?\s*"
+LINE_ITEM_RE = re.compile(
+    r"^(?P<desc>.+?)\s+(?P<qty>\d+(?:\.\d+)?)\s+"
+    + _SYM + r"(?P<price>[\d,]+\.\d{2})\s+"
+    + _SYM + r"(?P<amount>[\d,]+\.\d{2})\s*$"
+)
 
 
 class ExtractionError(Exception):
@@ -49,22 +63,52 @@ class ExtractionError(Exception):
 def parse_money(raw: str | None) -> str | None:
     if raw is None:
         return None
-    cleaned = raw.replace("$", "").replace(",", "").strip()
-    return cleaned or None
+    cleaned = re.sub(r"[^\d.\-()]", "", raw)
+    if cleaned.startswith("(") and cleaned.endswith(")"):  # accounting negative
+        cleaned = "-" + cleaned[1:-1]
+    return cleaned.replace("(", "").replace(")", "") or None
 
 
-def parse_date(raw: str | None) -> date | str | None:
-    """Return a ``date`` when a known format matches, else the raw string so
-    pydantic reports a clear schema error instead of us guessing."""
-    if raw is None:
-        return None
-    raw = raw.strip()
+DATE_TOKEN_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4}|\d{1,2}[ -][A-Za-z]{3,9}[ -,]+\d{4}|[A-Za-z]{3,9}\.? \d{1,2},? \d{4}"
+)
+
+
+def _try_formats(raw: str) -> date | None:
     for fmt in DATE_FORMATS:
         try:
             return datetime.strptime(raw, fmt).date()
         except ValueError:
             continue
+    return None
+
+
+def parse_date(raw: str | None) -> date | str | None:
+    """Return a ``date`` when a known format matches (also when the date is
+    followed by other text on the same line), else the raw string so pydantic
+    reports a clear schema error instead of us guessing."""
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if parsed := _try_formats(raw):
+        return parsed
+    for m in DATE_TOKEN_RE.finditer(raw):
+        token = re.sub(r"\s+", " ", m.group(0).replace(".", "")).strip(" ,")
+        if parsed := _try_formats(token) or _try_formats(token.replace(",", ", ").replace("  ", " ")):
+            return parsed
     return raw
+
+
+CURRENCY_CODE_RE = re.compile(r"\b(USD|NGN|GBP|EUR|INR|JPY|CAD|AUD|ZAR|KES|GHS)\s?\d")
+
+
+def _currency_from_symbols(text: str) -> str:
+    for symbol, code in CURRENCY_SYMBOLS.items():
+        if symbol in text:
+            return code
+    if m := CURRENCY_CODE_RE.search(text):
+        return m.group(1)
+    return DEFAULT_CURRENCY
 
 
 def _first_line(text: str) -> str | None:
@@ -129,7 +173,11 @@ def extract_raw(pdf_path: Path) -> dict[str, Any]:
     if not text.strip():
         raise ExtractionError("PDF contains no extractable text (scanned image?)")
 
-    raw: dict[str, Any] = {"source_file": pdf_path.name, "vendor_name": _first_line(text)}
+    labelled = VENDOR_LABEL_RE.search(text)
+    raw: dict[str, Any] = {
+        "source_file": pdf_path.name,
+        "vendor_name": labelled.group(1) if labelled else _first_line(text),
+    }
     for key, pattern in FIELD_PATTERNS.items():
         m = pattern.search(text)
         raw[key] = m.group(1).strip() if m else None
@@ -138,7 +186,7 @@ def extract_raw(pdf_path: Path) -> dict[str, Any]:
     raw["due_date"] = parse_date(raw["due_date"])
     for key in ("subtotal", "tax", "total"):
         raw[key] = parse_money(raw[key])
-    raw["currency"] = (raw["currency"] or "USD").upper()
+    raw["currency"] = (raw["currency"] or _currency_from_symbols(text)).upper()
     raw["line_items"] = _items_from_tables(tables) or _items_from_text(text)
     return {k: v for k, v in raw.items() if v is not None}
 

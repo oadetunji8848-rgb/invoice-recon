@@ -13,8 +13,11 @@ from pydantic import ValidationError
 
 import seed_invoices
 from extractor import extract_directory, extract_invoice, flag_duplicates
+from fpdf import FPDF
+
 from reconciler import (
     APPROVE_THRESHOLD,
+    PipelineInputError,
     load_ledger,
     normalize_vendor,
     reconcile,
@@ -32,6 +35,7 @@ from schemas import (
 
 D = Decimal
 BASE_DATE = date(2026, 10, 10)
+DEJAVU = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
 
 
 # ------------------------------------------------------------------ fixtures
@@ -315,3 +319,83 @@ class TestEndToEnd:
         result = load_ledger(p)
         assert [(e.txn_id, e.amount) for e in result.entries] == [("T1", D("1200.00")), ("T4", D("75.25"))]
         assert len(result.errors) == 3
+
+
+# ------------------------------------------------------- real-world inputs
+class TestRealWorldInputs:
+    def test_bank_export_with_debit_credit_and_day_first_dates(self, tmp_path):
+        p = tmp_path / "bank.csv"
+        p.write_text(
+            "Transaction Date,Narration,Reference,Debit,Credit,Balance\n"
+            "03/10/2026,TRF TO NORTHWIND LOGISTICS,FT001,\"2,263.40\",,10000.00\n"
+            "05/10/2026,SALARY CREDIT,FT002,,5000.00,15000.00\n"
+            "25/10/2026,POS PURCHASE,FT003,(45.10),,14954.90\n"
+        )
+        result = load_ledger(p)
+        assert [(e.txn_id, e.posted_date, e.amount) for e in result.entries] == [
+            ("FT001", date(2026, 10, 3), D("2263.40")),
+            ("FT003", date(2026, 10, 25), D("45.10")),
+        ]
+        assert result.skipped_credits == 1 and result.errors == []
+
+    def test_month_first_override_and_generated_ids(self, tmp_path):
+        p = tmp_path / "bank.csv"
+        p.write_text("Date;Payee;Amount\n03/04/2026;ACME;10.00\n")
+        assert load_ledger(p).entries[0].posted_date == date(2026, 4, 3)
+        entry = load_ledger(p, date_order="month-first").entries[0]
+        assert entry.posted_date == date(2026, 3, 4) and entry.txn_id == "ROW-2"
+
+    def test_unrecognised_columns_give_a_helpful_error(self, tmp_path):
+        p = tmp_path / "bank.csv"
+        p.write_text("when,what,howmuch\n2026-10-01,x,1.00\n")
+        with pytest.raises(ValueError, match="missing column"):
+            load_ledger(p)
+
+    @pytest.mark.parametrize("sym", ["₦", "NGN "])
+    def test_naira_vat_invoice_with_vendor_label(self, tmp_path, sym):
+        pdf = FPDF()
+        pdf.add_page()
+        if sym == "₦":
+            if not DEJAVU.exists():
+                pytest.skip("no Unicode font available to render the naira sign")
+            pdf.add_font("DejaVu", fname=str(DEJAVU))
+            pdf.set_font("DejaVu", size=11)
+        else:
+            pdf.set_font("Helvetica", size=11)
+        for line in (
+            "TAX INVOICE",
+            "From: Lagos Office Supplies Ltd",
+            "Invoice No: LOS/2026/044",
+            "Issue Date: 15/10/2026",
+            "Description Qty Unit Price Amount",
+            f"A4 paper ream 10 {sym}4,500.00 {sym}45,000.00",
+            f"Subtotal: {sym}45,000.00",
+            f"VAT (7.5%): {sym}3,375.00",
+            f"Grand Total: {sym}48,375.00",
+        ):
+            pdf.cell(0, 8, line, new_x="LMARGIN", new_y="NEXT")
+        path = tmp_path / "ngn.pdf"
+        pdf.output(str(path))
+
+        rec = extract_invoice(path)
+        assert isinstance(rec, InvoiceRecord), rec
+        assert rec.vendor_name == "Lagos Office Supplies Ltd"
+        assert rec.invoice_id == "LOS/2026/044"
+        assert rec.invoice_date == date(2026, 10, 15)
+        assert rec.line_items[0].amount == D("45000.00")
+        assert rec.tax == D("3375.00") and rec.total == D("48375.00")
+        assert rec.currency == "NGN"
+
+    def test_missing_inputs_raise_clean_errors(self, tmp_path, seeded):
+        inv_dir, ledger = seeded
+        with pytest.raises(PipelineInputError, match="not found"):
+            run_pipeline(tmp_path / "nope", ledger)
+        with pytest.raises(PipelineInputError, match="No PDF"):
+            run_pipeline(tmp_path, ledger)
+        with pytest.raises(PipelineInputError, match="Ledger CSV not found"):
+            run_pipeline(inv_dir, tmp_path / "missing.csv")
+
+    def test_markdown_summary_written(self, pipeline):
+        _, out = pipeline
+        md = (out / "summary.md").read_text()
+        assert "**8** auto-approved" in md and "INV-2026-1009" in md and "MATH_ERROR" in md

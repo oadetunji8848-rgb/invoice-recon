@@ -1,0 +1,79 @@
+name: Reconcile invoices
+
+# Runs automatically when you upload files into data/, or by hand from
+# Actions -> Reconcile invoices -> Run workflow.
+on:
+  push:
+    branches: [main]
+    paths: ["data/**/*.pdf", "data/**/*.PDF", "data/**/*.csv"]
+  workflow_dispatch:
+    inputs:
+      invoices:
+        description: "Folder of PDF invoices (use sample_invoices to try the demo)"
+        default: data/invoices
+        required: true
+      ledger:
+        description: "Bank export CSV (use bank_ledger.csv for the demo)"
+        default: data/bank_ledger.csv
+        required: true
+      date_order:
+        description: "How to read ledger dates like 03/04/2026"
+        type: choice
+        options: [auto, day-first, month-first]
+        default: auto
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reconcile-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      - name: Reconcile
+        shell: bash
+        env:
+          # Inputs go through env vars, never straight into the script.
+          INVOICES: ${{ inputs.invoices || 'data/invoices' }}
+          LEDGER: ${{ inputs.ledger || 'data/bank_ledger.csv' }}
+          DATE_ORDER: ${{ inputs.date_order || 'auto' }}
+        run: |
+          set +e
+          python reconciler.py --invoices "$INVOICES" --ledger "$LEDGER" --date-order "$DATE_ORDER" --out output -v 2>&1 | tee run.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -ne 0 ]; then
+            msg=$(grep -m1 '^ERROR:' run.log || echo "Reconciliation failed - see the log")
+            echo "::error::${msg#ERROR: }"
+            {
+              echo "## ❌ Reconciliation did not run"
+              echo
+              echo "${msg#ERROR: }"
+              echo
+              echo "Upload your PDFs to \`data/invoices/\` and your bank export to \`data/bank_ledger.csv\`,"
+              echo "or run the workflow with \`sample_invoices\` and \`bank_ledger.csv\` to try the demo."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit "$status"
+          fi
+          cat output/summary.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n---\nDownload **reconciliation-report** under *Artifacts* below for the Excel workbook and JSON files.\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: reconciliation-report
+          path: |
+            output/reconciliation_report.xlsx
+            output/approved_matches.json
+            output/review_queue.json
+            output/summary.md
+          retention-days: 30
