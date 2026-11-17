@@ -17,3 +17,7 @@ pytest
 | `seed_invoices.py` | Sample data with the edge cases listed in `EDGE_CASES` |
 
 **Scoring:** amount must match to the cent and the payment must post within ±5 days. Score = 50 (amount) + up to 20 (date: full credit within 2 days, 10 at day 5) + up to 30 (vendor similarity). Approval needs score ≥ 90, vendor similarity ≥ 80, and no competing ledger row within 5 points. Everything else goes to the review queue.
+
+## GitHub Actions
+
+`.github/workflows/pipeline.yml` runs the tests on Python 3.11–3.13 for every push to `main` and every pull request. It then runs the reconciliation and uploads `output/` (the JSON queues and the Excel report) as the `reconciliation-output` artifact. To run it by hand, open **Actions → Reconciliation pipeline → Run workflow**.
